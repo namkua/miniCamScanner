@@ -47,9 +47,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title"><span class="brand-name">Mini CamScanner - Quét & Cải Thiện Tài Liệu</span></div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Đồ án Xử lý ảnh: Phát hiện biên, nắn phối cảnh, triệt tiêu bóng đổ & bộ lọc Magic Color</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Định vị 4 góc bằng YOLO11n-Pose ONNX, nắn phối cảnh, triệt tiêu bóng đổ & bộ lọc Magic Color</div>', unsafe_allow_html=True)
 
-scanner = DocumentScanner()
+
+@st.cache_resource
+def get_scanner():
+    return DocumentScanner()
+
+
+scanner = get_scanner()
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
@@ -62,15 +68,15 @@ with st.sidebar:
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     st.markdown("---")
-    st.subheader("Hướng nhận diện khung (Corner Detection)")
-    detect_choice = st.radio(
-        "Chọn phương pháp bắt khung:",
-        [
-            "Xử lý ảnh cổ điển (OpenCV)",
-            "AI Segmentation"
-        ]
+    st.subheader("Nhận diện 4 góc (YOLO11n-Pose ONNX)")
+    st.caption("Model: `models/yolo11n_doc_corner.onnx`")
+    conf_threshold = st.slider(
+        "Ngưỡng tin cậy (Confidence):",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.25,
+        step=0.05,
     )
-    detect_method = "ai" if "AI Segmentation" in detect_choice else "classical"
 
     rotation = st.selectbox("Xoay tài liệu:", [0, 90, 180, 270], format_func=lambda x: f"{x}°")
 
@@ -84,32 +90,39 @@ with st.sidebar:
 
 # --- MAIN CONTENT ---
 if image is not None:
-    # 1. Tự động phát hiện 4 góc
+    # 1. Tự động phát hiện 4 góc bằng YOLO11n-Pose ONNX
     orig_h, orig_w = image.shape[:2]
-    auto_corners, debug_info = scanner.detect_corners(image, method=detect_method)
+    auto_corners, debug_info = scanner.detect_corners(image, conf_threshold=conf_threshold)
 
     # Hiển thị thông báo trạng thái nhận diện góc
-    if debug_info.get("ai_message"):
-        if debug_info.get("ai_status") == "ok":
-            st.success(debug_info['ai_message'])
-        else:
-            st.warning(debug_info['ai_message'])
-    if debug_info.get("is_full_frame", False):
-        st.info("Ảnh chụp cận cảnh tràn khung hình: Hệ thống tự động chọn trọn vẹn toàn bộ trang giấy.")
-    elif debug_info.get("is_fallback", False):
-        st.warning("Không tìm thấy khung viền 4 cạnh rõ nét, hệ thống đã dùng khung bao chữ nhật mặc định.")
+    if debug_info.get("detected", False):
+        st.success(debug_info["status_message"])
+    else:
+        st.warning(debug_info["status_message"])
 
     col1, col2 = st.columns([1, 1])
 
     with col1:
         st.subheader("1. Ảnh gốc & 4 góc định vị")
-        # Vẽ 4 góc lên ảnh hiển thị
         preview_corners_img = image.copy()
-        pts_int = auto_corners.astype(int)
-        cv2.polylines(preview_corners_img, [pts_int], isClosed=True, color=(0, 255, 0), thickness=4)
-        for i, pt in enumerate(pts_int):
-            cv2.circle(preview_corners_img, tuple(pt), 12, (0, 0, 255), -1)
-            cv2.putText(preview_corners_img, f"P{i+1}", (pt[0]+15, pt[1]+15), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+        pts_int = np.round(auto_corners).astype(int)
+        line_thickness = max(2, int(round(min(orig_h, orig_w) / 250)))
+        point_radius = max(5, int(round(min(orig_h, orig_w) / 100)))
+        font_scale = max(0.6, min(orig_h, orig_w) / 900.0)
+        corner_names = ("TL", "TR", "BR", "BL")
+
+        cv2.polylines(preview_corners_img, [pts_int], isClosed=True, color=(0, 255, 0), thickness=line_thickness)
+        for label, pt in zip(corner_names, pts_int):
+            cv2.circle(preview_corners_img, tuple(pt), point_radius, (0, 0, 255), -1)
+            cv2.putText(
+                preview_corners_img,
+                label,
+                (int(pt[0]) + point_radius + 4, int(pt[1]) - point_radius),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (255, 255, 0),
+                max(2, line_thickness),
+            )
         
         st.image(cv2.cvtColor(preview_corners_img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
@@ -163,27 +176,22 @@ if image is not None:
             use_container_width=True
         )
 
-    # 3. Hiển thị các bước trung gian (DIP Stages)
+    # 3. Hiển thị các bước trung gian (YOLO11n-Pose & Background Map)
     if show_debug and debug_info:
         st.markdown("---")
-        st.subheader("Các bước Xử lý ảnh trung gian (DIP Pipeline Stages)")
-        d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+        st.subheader("Các bước Xử lý ảnh trung gian (YOLO11n-Pose & DIP Stages)")
+        d_col1, d_col2, d_col3 = st.columns(3)
 
         with d_col1:
-            st.caption("1. Dò cạnh thích ứng (Auto-Canny)")
-            st.image(debug_info["edged"], use_container_width=True)
+            st.caption("1. Ảnh đầu vào YOLO Letterbox (640×640)")
+            st.image(cv2.cvtColor(debug_info["letterbox_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with d_col2:
-            st.caption("2. Nối mép viền (Morph Close)")
-            st.image(debug_info["closed"], use_container_width=True)
+            st.caption("2. Định vị Box & 4 góc YOLO11n-Pose")
+            st.image(cv2.cvtColor(debug_info["detection_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
 
         with d_col3:
-            st.caption("3. Đa giác Contour tìm được")
-            st.image(cv2.cvtColor(debug_info["contour_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
-
-        with d_col4:
-            st.caption("4. Bản đồ ước lượng nền (Background Map)")
-            # Tính bản đồ nền của ảnh warped
+            st.caption("3. Bản đồ ước lượng nền (Background Map)")
             if len(warped.shape) == 3:
                 w_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             else:
